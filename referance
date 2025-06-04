@@ -1,0 +1,367 @@
+https://medium.com/@sajith_k/creating-an-mcp-server-and-integrating-with-langgraph-5f4fa434a4c7
+I can certainly help you with that! Based on the information you provided, I'll create the necessary Python code files and give you a step-by-step guide on how to set up and run the MCP servers and the LangGraph agent.
+
+You'll need three Python files:
+
+math_mcp_server.py: The first MCP server for math operations.
+bmi_mcp_server.py: The second MCP server for BMI calculation.
+langgraph_mcp_agent.py: The LangGraph agent that integrates with both MCP servers.
+
+# math_mcp_server.py
+# This file defines an MCP server named "Math" with prompts, resources, and tools
+# for basic mathematical operations.
+
+from mcp.server.fastmcp import FastMCP
+
+# Initialize the MCP server with the name "Math"
+mcp = FastMCP("Math")
+
+# --- Prompts ---
+# Prompts are standardized inputs that LLMs can use.
+
+@mcp.prompt()
+def example_prompt(question: str) -> str:
+    """
+    Example prompt description.
+    This prompt provides instructions for a math assistant.
+    """
+    return f"""
+    You are a math assistant. Answer the question.
+    Question: {question}
+    """
+
+@mcp.prompt()
+def system_prompt() -> str:
+    """
+    System prompt description.
+    This prompt provides general instructions for an AI assistant.
+    """
+    return """
+    You are an AI assistant use the tools if needed.
+    """
+
+# --- Resources ---
+# Resources are data sources that the AI can access.
+
+@mcp.resource("greeting://{name}")
+def get_greeting(name: str) -> str:
+    """
+    Get a personalized greeting.
+    This is a dynamic resource that generates a greeting based on the provided name.
+    """
+    return f"Hello, {name}!"
+
+@mcp.resource("config://app")
+def get_config() -> str:
+    """
+    Static configuration data.
+    This is a static resource providing application configuration.
+    """
+    return "App configuration here"
+
+# --- Tools ---
+# Tools are functions or operations that the AI can execute.
+
+@mcp.tool()
+def add(a: int, b: int) -> int:
+    """
+    Add two numbers.
+    This tool performs addition of two integer numbers.
+    """
+    return a + b
+
+@mcp.tool()
+def multiply(a: int, b: int) -> int:
+    """
+    Multiply two numbers.
+    This tool performs multiplication of two integer numbers.
+    """
+    return a * b
+
+# Main execution block: runs the server.
+# For this example, we'll run it using stdio, as required by the LangGraph client.
+# If you wanted to run it as an HTTP server, you would use mcp.run(transport="streamable-http")
+if __name__ == "__main__":
+    # Run the MCP server via standard I/O.
+    # This allows the LangGraph agent to communicate with it as a subprocess.
+    mcp.run()
+
+# bmi_mcp_server.py
+# This file defines a second MCP server named "BMI" with a tool for calculating BMI.
+# This server will run over HTTP.
+
+from mcp.server.fastmcp import FastMCP
+
+# Initialize the MCP server with the name "BMI"
+mcp = FastMCP("BMI")
+
+# --- Tools ---
+# Define a tool to calculate Body Mass Index (BMI).
+# BMI = weight (kg) / (height (m) * height (m))
+
+@mcp.tool()
+def calculate_bmi(weight: int, height: int) -> str:
+    """
+    Calculate BMI (Body Mass Index).
+    Takes weight in kilograms and height in meters as input.
+    """
+    if height <= 0:
+        return "Error: Height must be greater than zero."
+    bmi_value = weight / (height * height)
+    return f"BMI: {bmi_value:.2f}" # Format to two decimal places
+
+# Main execution block: runs the server.
+# This server will run via streamable-http, making it accessible at http://localhost:8000/mcp
+if __name__ == "__main__":
+    # Run the MCP server via streamable-http.
+    # It will typically be available at http://localhost:8000/mcp by default.
+    mcp.run(transport="streamable-http")
+
+# langgraph_mcp_agent.py
+# This file integrates multiple MCP servers (Math and BMI) with LangGraph
+# to create an AI agent capable of using tools from both servers.
+
+from typing import List, Annotated, TypedDict
+import asyncio
+
+# LangChain and LangGraph imports
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.prebuilt import tools_condition, ToolNode
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.checkpoint.memory import MemorySaver
+
+# MCP client and adapter imports
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.prompts import load_mcp_prompt
+
+# --- MultiServerMCPClient Setup ---
+# This client configures connections to multiple MCP servers.
+# "math" server uses stdio transport, meaning it will be run as a subprocess.
+# "bmi" server uses streamable_http transport, meaning it expects an HTTP server running.
+client = MultiServerMCPClient(
+    {
+        "math": {
+            "command": "python",
+            "args": ["math_mcp_server.py"], # Command to run the math server
+            "transport": "stdio",
+        },
+        "bmi": {
+            "url": "http://localhost:8000/mcp", # URL where the BMI server is expected to run
+            "transport": "streamable_http",
+        }
+    }
+)
+
+# --- State Management for LangGraph ---
+# Defines the state structure for our graph, which will primarily hold messages.
+class State(TypedDict):
+    messages: Annotated[List[AnyMessage], add_messages]
+
+# --- Graph Creation Function ---
+# This function sets up the LangGraph agent, loading tools and prompts from MCP sessions.
+async def create_graph(math_session, bmi_session):
+    """
+    Creates and compiles the LangGraph agent.
+    Args:
+        math_session: The MCP client session for the "math" server.
+        bmi_session: The MCP client session for the "bmi" server.
+    Returns:
+        A compiled LangGraph agent.
+    """
+    # Initialize the Language Model (LLM)
+    # IMPORTANT: Replace "your_google_api_key" with your actual Google API key.
+    # You can get one from Google AI Studio.
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0, api_key="your_google_api_key")
+    
+    # Load tools from both MCP servers
+    math_tools = await load_mcp_tools(math_session)
+    bmi_tools = await load_mcp_tools(bmi_session)
+    # Combine all tools into a single list
+    tools = math_tools + bmi_tools
+    
+    # Bind the loaded tools to the LLM
+    llm_with_tool = llm.bind_tools(tools)
+    
+    # Load the system prompt from the "math" MCP server
+    # The system prompt provides general instructions to the AI.
+    system_prompt_messages = await load_mcp_prompt(math_session, "system_prompt")
+    # Extract the content of the system prompt (it's a list of messages, we take the first one's content)
+    system_prompt_content = system_prompt_messages[0].content
+
+    # Create a chat prompt template using the system prompt and a messages placeholder
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", system_prompt_content),
+        MessagesPlaceholder("messages") # Placeholder for conversation history
+    ])
+    
+    # Chain the prompt template with the LLM that has tools bound
+    chat_llm = prompt_template | llm_with_tool
+
+    # --- Nodes for the Graph ---
+    # A node represents a step in the workflow.
+
+    def chat_node(state: State) -> State:
+        """
+        The chat node invokes the LLM to generate a response.
+        It updates the 'messages' in the state with the LLM's output.
+        """
+        # Invoke the LLM with the current conversation messages
+        state["messages"] = chat_llm.invoke({"messages": state["messages"]})
+        return state
+
+    # --- Building the LangGraph ---
+    # Defines the flow and transitions between nodes.
+    graph_builder = StateGraph(State)
+    
+    # Add nodes to the graph
+    graph_builder.add_node("chat_node", chat_node)
+    # ToolNode automatically handles tool execution based on LLM output
+    graph_builder.add_node("tool_node", ToolNode(tools=tools))
+    
+    # Define edges (transitions) between nodes
+    # Start the graph by going to the chat_node
+    graph_builder.add_edge(START, "chat_node")
+    
+    # Conditional edge from chat_node:
+    # If the LLM output suggests using a tool, go to "tool_node".
+    # Otherwise, if the LLM output is a final answer, end the graph ("__end__").
+    graph_builder.add_conditional_edges(
+        "chat_node",
+        tools_condition, # LangGraph's prebuilt condition to check for tool calls
+        {"tools": "tool_node", "__end__": END}
+    )
+    
+    # After a tool is executed, return to the chat_node to allow the LLM to process the tool's result
+    graph_builder.add_edge("tool_node", "chat_node")
+    
+    # Compile the graph with a memory checkpointer for state persistence across turns
+    graph = graph_builder.compile(checkpointer=MemorySaver())
+    return graph
+
+# --- Main Execution Function ---
+async def main():
+    """
+    Main function to run the LangGraph agent and interact with the user.
+    """
+    # Configuration for the agent (e.g., thread_id for checkpointing)
+    config = {"configurable": {"thread_id": 1234}}
+
+    # Use persistent sessions for both MCP servers.
+    # This ensures the servers remain active throughout the agent's lifetime.
+    async with client.session("math") as math_session, client.session("bmi") as bmi_session:
+        # Create the LangGraph agent with the established MCP sessions
+        agent = await create_graph(math_session, bmi_session)
+        
+        print("LangGraph agent initialized. Type 'exit' to quit.")
+        # Start the interaction loop
+        while True:
+            try:
+                message = input("User: ")
+                if message.lower() == 'exit':
+                    break
+                
+                # Invoke the agent with the user's message
+                response = await agent.ainvoke({"messages": message}, config=config)
+                # Print the last message from the agent's response
+                print("AI: " + response["messages"][-1].content)
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                # In a real application, you might want more robust error handling or logging here.
+
+# Entry point for running the script
+if __name__ == "__main__":
+    # Run the asynchronous main function
+    asyncio.run(main())
+
+I can certainly help you with that! Based on the information you provided, I'll create the necessary Python code files and give you a step-by-step guide on how to set up and run the MCP servers and the LangGraph agent.
+
+You'll need three Python files:
+
+math_mcp_server.py: The first MCP server for math operations.
+bmi_mcp_server.py: The second MCP server for BMI calculation.
+langgraph_mcp_agent.py: The LangGraph agent that integrates with both MCP servers.
+Let's start with the code.
+Math MCP Server Code
+Jun 4, 12:35 PM
+
+Open
+BMI MCP Server Code
+Jun 4, 12:35 PM
+
+Open
+LangGraph MCP Agent Code
+Jun 4, 12:35 PM
+
+Open
+
+How to Run the Code
+Follow these steps carefully to set up and run your MCP servers and LangGraph agent.
+
+Step 1: Prerequisites
+Python: Ensure you have Python 3.9+ installed on your system.
+Google AI Studio API Key: You'll need an API key for the gemini-2.0-flash model. You can obtain one from Google AI Studio. Replace "your_google_api_key" in langgraph_mcp_agent.py with your actual key.
+Step 2: Install Required Packages
+Open your terminal or command prompt and run the following command to install all necessary Python packages:
+
+Bash
+
+pip install mcp langchain langgraph langchain-google-genai langchain-mcp-adapters uvicorn
+mcp: The Model Context Protocol SDK.
+langchain, langgraph: Core libraries for building LLM applications and stateful agents.
+langchain-google-genai: Integration for Google's Generative AI models.
+langchain-mcp-adapters: Adapters to connect LangChain/LangGraph with MCP.
+uvicorn: An ASGI server used by FastMCP for HTTP transport.
+Step 3: Save the Code Files
+Create three new Python files in the same directory and copy the respective code blocks into them:
+
+math_mcp_server.py: Copy the content from the "Math MCP Server Code" block.
+bmi_mcp_server.py: Copy the content from the "BMI MCP Server Code" block.
+langgraph_mcp_agent.py: Copy the content from the "LangGraph MCP Agent Code" block. Remember to replace "your_google_api_key" with your actual API key.
+Step 4: Run the MCP Servers
+You need to run the two MCP servers in separate terminal windows.
+
+Open Terminal 1 (for Math Server):
+Navigate to the directory where you saved your files and run:
+
+Bash
+
+python math_mcp_server.py
+This server runs using stdio and will likely not show much output in the terminal until the agent connects to it. Keep this terminal open.
+
+Open Terminal 2 (for BMI Server):
+Navigate to the same directory and run:
+
+Bash
+
+python bmi_mcp_server.py
+This server runs using streamable-http and will typically start an HTTP server on http://localhost:8000/mcp. You should see output indicating that the Uvicorn server is running. Keep this terminal open.
+
+Note: If port 8000 is already in use, the bmi_mcp_server.py might fail to start. You might need to free up the port or modify the bmi_mcp_server.py to use a different port (though the MultiServerMCPClient configuration would also need to be updated accordingly). For this example, we assume http://localhost:8000 is available.
+Step 5: Run the LangGraph Agent
+Open Terminal 3 (for LangGraph Agent): Navigate to the same directory and run:
+Bash
+
+python langgraph_mcp_agent.py
+This terminal will show output as the agent initializes and connects to the MCP servers.
+Step 6: Interact with the Agent
+Once the LangGraph agent starts, you'll see LangGraph agent initialized. Type 'exit' to quit. You can now type your questions and see the agent respond.
+
+Example Interactions:
+
+User: Hi
+AI: Hi there! How can I help you today?
+User: how many tools do you have
+AI: I have 3 tools available: `add`, `multiply`, and `calculate_bmi`.
+User: what is 10 + 5
+AI: 10 + 5 = 15
+User: calculate my bmi if my weight is 70 kg and height is 1.75 meters
+AI: BMI: 70 / (1.75 * 1.75) = 22.86
+User: what is 6 multiplied by 7
+AI: 6 * 7 = 42
+User: exit
+You should observe the agent correctly identifying and utilizing the add, multiply, and calculate_bmi tools from their respective MCP servers.
+
+This setup provides a complete working example of how to leverage MCP for tool and prompt management within a LangGraph agent, demonstrating the powerful synergy between these two libraries. Remember to keep all three terminals open for the agent to function correctly.
