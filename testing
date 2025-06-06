@@ -1,0 +1,197 @@
+# langgraph_mcp_agent.py
+# This file integrates FileSystem and Utility MCP servers with LangGraph
+# to create an AI agent capable of using tools from these servers.
+
+from typing import List, Annotated, TypedDict
+import asyncio
+import json
+
+# LangChain and LangGraph imports
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langgraph.prebuilt import tools_condition, ToolNode
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import Tool  # Specifically import Tool class for defining tools
+
+# Gemini specific imports
+import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# MCP client and adapter imports
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.prompts import load_mcp_prompt
+
+# --- Gemini LLM Integration ---
+# Hardcode your Google API Key here
+# IMPORTANT: For production environments, it is HIGHLY recommended to use environment variables
+# or a secure configuration management system instead of hardcoding API keys.
+GOOGLE_API_KEY = "AIzaSyDYzDz4w7XjSZFUfPJtT5bH1WhiIyTMzoA"  # <--- REPLACE THIS WITH YOUR ACTUAL GOOGLE API KEY!
+
+# Configure the Gemini API
+genai.configure(api_key=GOOGLE_API_KEY)
+
+
+# --- State Management for LangGraph ---
+class State(TypedDict):
+    messages: Annotated[List[AnyMessage], add_messages]
+
+
+# --- MultiServerMCPClient Setup ---
+# Now configured to manage "filesystem" and "utility" servers (summarizer removed)
+client = MultiServerMCPClient(
+    {
+        "filesystem": {
+            "command": "python",
+            # Ensure this path is correct for your system or use a relative path
+            "args": ["file_system_server.py"],  # Assuming file_system_server.py is in the same directory
+            "transport": "stdio",
+        },
+        "utility": {  # Utility Server configuration
+            "url": "http://localhost:8000/mcp",  # URL for the UtilityServer
+            "transport": "streamable_http",
+        },
+        # "summarizer" server configuration removed
+    }
+)
+
+
+# --- Graph Creation Function ---
+async def create_graph(filesystem_session, utility_session):  # summarizer_session removed
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.4,
+                                 google_api_key=GOOGLE_API_KEY)  # Updated model
+
+    # Load tools from relevant MCP servers
+    filesystem_mcp_tools = await load_mcp_tools(filesystem_session)
+    utility_mcp_tools = await load_mcp_tools(utility_session)
+    # summarizer_mcp_tools loading removed
+
+    all_mcp_tools = filesystem_mcp_tools + utility_mcp_tools # Combine relevant MCP tools
+
+    # Convert MCP tools to LangChain Tools for Gemini's function calling
+    langchain_tools = []
+    for mcp_tool in all_mcp_tools:  # Iterate over combined tools
+        langchain_tool_instance = Tool(
+            name=mcp_tool.name,
+            description=mcp_tool.description,
+            func=lambda *args, **kwargs: None,  # Dummy function
+            args_schema=mcp_tool.args_schema
+        )
+        langchain_tools.append(langchain_tool_instance)
+
+    llm_with_tools = llm.bind_tools(langchain_tools)
+
+    # Load the system prompt from the "filesystem" MCP server (or choose/combine prompts)
+    # For this example, we'll stick to the filesystem's main prompt and add general instructions.
+    base_system_prompt_content = "You are a helpful AI assistant. Use the provided tools when necessary."
+    try:
+        fs_system_prompt_messages = await load_mcp_prompt(filesystem_session, "system_prompt")
+        base_system_prompt_content = fs_system_prompt_messages[0].content
+    except Exception as e:
+        print(f"Warning: Could not load system_prompt from filesystem_session: {e}. Using a default prompt.")
+
+    # Attempt to load system prompts from other servers and combine them
+    try:
+        util_system_prompt_messages = await load_mcp_prompt(utility_session, "system_prompt")
+        base_system_prompt_content += "\n" + util_system_prompt_messages[0].content
+    except Exception:
+        pass  # Ignore if utility server doesn't have it or fails to load
+
+    # summarizer system prompt loading removed
+
+    # Enhanced system prompt to guide the LLM about available tool categories
+    enhanced_system_prompt = (
+            base_system_prompt_content + "\n\n" +
+            "You have access to a set of tools to help with user requests:\n" +
+            "- **File System Tools:** For creating, appending to, and reading text files. (e.g., `create_text_file`, `append_to_text_file`, `read_text_file`)\n" +
+            "- **Utility Tools:** For general utility functions. (e.g., `get_current_datetime`)\n\n" +
+            # Summarization Tools guidelines removed
+            "**Important Tool Usage Guidelines:**\n" +
+            "- If the user asks to create a file, save text to a file, or write to a new file, use the `create_text_file` tool.\n" +
+            "- If the user asks to add content to an existing file or append text, use the `append_to_text_file` tool.\n" +
+            "- If the user asks to read a file or show its content, use the `read_text_file` tool.\n" +
+            "- If the user asks for the current time or date, use the `get_current_datetime` tool."
+            # Summarization tool guidelines removed
+    )
+
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", enhanced_system_prompt),
+        MessagesPlaceholder("messages")
+    ])
+
+    chat_llm = prompt_template | llm_with_tools
+
+    def chat_node(state: State) -> State:
+        result = chat_llm.invoke({"messages": state["messages"]})
+        return {"messages": [result]}
+
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("chat_node", chat_node)
+    # ToolNode now uses the combined list of all_mcp_tools
+    graph_builder.add_node("tool_node", ToolNode(tools=all_mcp_tools))
+
+    graph_builder.add_edge(START, "chat_node")
+    graph_builder.add_conditional_edges(
+        "chat_node",
+        tools_condition,
+        {"tools": "tool_node", "__end__": END}
+    )
+    graph_builder.add_edge("tool_node", "chat_node")
+
+    graph = graph_builder.compile(checkpointer=MemorySaver())
+    return graph
+
+
+# --- Main Execution Function ---
+async def main():
+    config = {"configurable": {"thread_id": "user_123"}}  # Using a string for thread_id
+
+    print("Main: Creating MCP client sessions for 'filesystem' and 'utility' servers...")
+    # Use persistent sessions for all relevant MCP servers
+    async with client.session("filesystem") as filesystem_session, \
+            client.session("utility") as utility_session: # summarizer_session removed
+        print("Main: MCP 'filesystem' and 'utility' sessions created. Creating LangGraph agent...")
+        agent = await create_graph(filesystem_session, utility_session)  # Pass only relevant sessions
+        print("LangGraph agent initialized. Type 'exit' to quit.")
+
+        while True:
+            try:
+                message_content = input("User: ")
+                if message_content.lower() == 'exit':
+                    print("Exiting...")
+                    break
+
+                print(f"Main: Invoking agent with message: '{message_content}'")
+                response = await agent.ainvoke({"messages": [HumanMessage(content=message_content)]}, config=config)
+
+                print("\n--- Agent Response Trace ---")
+                for msg in response["messages"]:
+                    if isinstance(msg, HumanMessage):
+                        print(f"Human: {msg.content}")
+                    elif isinstance(msg, AIMessage):
+                        if msg.tool_calls:
+                            print(f"AI (Tool Call Triggered for): {[tc['name'] for tc in msg.tool_calls]}")
+                        if msg.content:
+                            print(f"AI (Content): {msg.content}")
+                    elif isinstance(msg, ToolMessage):
+                        print(
+                            f"Tool Output (Name: {msg.name if hasattr(msg, 'name') else 'N/A'}, Call ID: {msg.tool_call_id or 'N/A'}): {msg.content}")
+                print("--- End Trace ---\n")
+
+                final_ai_message = next((msg for msg in reversed(response["messages"]) if
+                                         isinstance(msg, AIMessage) and msg.content and msg.content.strip()), None)
+                if final_ai_message:
+                    print(f"AI: {final_ai_message.content}")
+                else:
+                    print("AI: (Processed the request. The result might be in the file or from a tool action.)")
+
+            except Exception as e:
+                print(f"An error occurred: {e}")
+                import traceback
+                traceback.print_exc()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
